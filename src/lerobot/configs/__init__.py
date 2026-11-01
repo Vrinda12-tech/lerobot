@@ -30,6 +30,7 @@ from .types import (
     PipelineFeatureType,
     PolicyFeature,
     RTCAttentionSchedule,
+    RTCGuidanceJacobian,
 )
 from .video import (
     DEFAULT_DEPTH_UNIT,
@@ -54,6 +55,7 @@ __all__ = [
     "PipelineFeatureType",
     "PolicyFeature",
     "RTCAttentionSchedule",
+    "RTCGuidanceJacobian",
     # Config classes
     "DatasetRecordConfig",
     "DatasetConfig",

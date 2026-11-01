@@ -856,3 +856,52 @@ def test_vjp_ignores_model_padding_dims():
     masked_err[:, :4, :3] = (prev_chunk - x1[..., :3])[:, :4]
     expected = x_t @ mixing - 2.0 * masked_err @ x1_map_t.T
     assert torch.allclose(result, expected, atol=1e-5)
+
+
+def test_vjp_matches_explicit_autograd_grad_on_a_nonlinear_denoiser():
+    """Nonlinear denoiser: the correction must match an explicit ``autograd.grad``."""
+    torch.manual_seed(0)
+    chunk_size, action_dim, delay, time = 10, 3, 3, 0.6
+    weight = torch.randn(action_dim, action_dim) * 0.8
+    denoiser = lambda x: torch.tanh(x @ weight)  # noqa: E731
+    processor = RTCProcessor(RTCConfig(execution_horizon=8, guidance_jacobian="vjp"))
+
+    x_t = torch.randn(1, chunk_size, action_dim)
+    prev_chunk = torch.randn(1, 6, action_dim)
+    result = processor.denoise_step(x_t, prev_chunk, delay, time, denoiser, execution_horizon=8)
+
+    # Reference VJP; the 6-row leftover clamps execution_horizon to 6 for the weights.
+    x_ref = x_t.clone().requires_grad_(True)
+    v_ref = denoiser(x_ref)
+    x1_ref = x_ref - time * v_ref
+    weights = processor.get_prefix_weights(delay, 6, chunk_size).view(1, chunk_size, 1)
+    padded = torch.zeros_like(x_t)
+    padded[:, :6] = prev_chunk
+    err = ((padded - x1_ref) * weights).detach()
+    (vjp,) = torch.autograd.grad(x1_ref, x_ref, err)
+    tau = 1.0 - time
+    guidance_weight = min((1.0 - tau) / tau * ((1.0 - tau) ** 2 + tau**2) / (1.0 - tau) ** 2, 10.0)
+
+    assert torch.allclose(result, v_ref.detach() - guidance_weight * vjp, atol=1e-6)
+    # Must differ from the identity variant, which uses err in place of J^T err.
+    assert not torch.allclose(result, v_ref.detach() - guidance_weight * err, atol=1e-3)
+
+
+@pytest.mark.parametrize("guidance_jacobian", ["identity", "vjp"])
+def test_debug_tracker_stores_detached_tensors(guidance_jacobian):
+    """The result and the tracked tensors must not carry an autograd graph."""
+    torch.manual_seed(0)
+    chunk_size, action_dim = 10, 2
+    x_t = torch.randn(1, chunk_size, action_dim)
+    prev_chunk = torch.randn(1, chunk_size, action_dim)
+    linear = torch.nn.Linear(action_dim, action_dim)  # weights require grad by default
+
+    processor = RTCProcessor(RTCConfig(debug=True, guidance_jacobian=guidance_jacobian))
+    result = processor.denoise_step(x_t, prev_chunk, 4, 0.5, linear, execution_horizon=4)
+
+    assert not result.requires_grad
+    step = processor.get_all_debug_steps()[-1]
+    for name in ("x1_t", "correction", "err"):
+        tensor = getattr(step, name)
+        assert tensor is not None, name
+        assert tensor.grad_fn is None and not tensor.requires_grad, name
